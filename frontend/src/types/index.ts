@@ -884,6 +884,15 @@ export interface UpstreamBillingData {
 
 export type UpstreamBillingProbeStatus = 'ok' | 'unsupported' | 'failed'
 
+export interface UpstreamBillingProbeRateLimit {
+  window: '5h' | '1d' | '7d'
+  limit: number
+  used: number
+  remaining: number
+  window_start?: string
+  reset_at?: string
+}
+
 export interface UpstreamBillingProbeSnapshot {
   status: UpstreamBillingProbeStatus
   data?: UpstreamBillingData
@@ -894,6 +903,7 @@ export interface UpstreamBillingProbeSnapshot {
   failure_count?: number
   http_status?: number
   last_error?: string
+  rate_limits?: Partial<Record<'5h' | '1d' | '7d', UpstreamBillingProbeRateLimit>>
 }
 
 export interface UpstreamBillingProbeSettings {

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -271,10 +272,11 @@ func TestUpstreamBillingProbeSuccessPersistsSanitizedSnapshot(t *testing.T) {
 		},
 	}
 	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{account.ID: account}}
-	upstream := &httpUpstreamRecorder{resp: &http.Response{
-		StatusCode: http.StatusOK,
-		Header:     http.Header{"Content-Type": []string{"application/json"}},
-		Body: io.NopCloser(strings.NewReader(`{
+	upstream := &httpUpstreamRecorder{responses: []*http.Response{
+		{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{
 			"object":"sub2api.key_billing",
 			"schema_version":1,
 			"billing_scope":"token",
@@ -291,6 +293,15 @@ func TestUpstreamBillingProbeSuccessPersistsSanitizedSnapshot(t *testing.T) {
 			"observed_at":"2026-07-13T01:00:00Z",
 			"unexpected_secret":"must-not-persist"
 		}`)),
+		},
+		{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{
+				"mode":"quota_limited",
+				"rate_limits":[{"window":"7d","limit":600,"used":5.8,"remaining":594.2,"window_start":"2026-07-13T00:00:00Z","reset_at":"2026-07-20T00:00:00Z","api_key":"must-not-persist"}]
+			}`)),
+		},
 	}}
 	svc := newUpstreamBillingProbeTestService(repo, upstream, &upstreamBillingProbeSettingRepo{})
 	fixedNow := time.Date(2026, time.July, 13, 2, 0, 0, 0, time.UTC)
@@ -307,14 +318,110 @@ func TestUpstreamBillingProbeSuccessPersistsSanitizedSnapshot(t *testing.T) {
 	require.Equal(t, fixedNow.Add(time.Hour), *snapshot.FreshUntil)
 	require.False(t, snapshot.NextProbeAt.Before(fixedNow.Add(24*time.Minute)))
 	require.False(t, snapshot.NextProbeAt.After(fixedNow.Add(36*time.Minute)))
-	require.Equal(t, "https://upstream.example/v1/sub2api/billing", upstream.lastReq.URL.String())
-	require.Equal(t, http.MethodGet, upstream.lastReq.Method)
-	require.Equal(t, "Bearer sk-sensitive", upstream.lastReq.Header.Get("Authorization"))
-	require.True(t, HTTPUpstreamRedirectsDisabled(upstream.lastReq.Context()))
+	require.Len(t, upstream.requests, 2)
+	require.Equal(t, "https://upstream.example/v1/sub2api/billing", upstream.requests[0].URL.String())
+	require.Equal(t, "https://upstream.example/v1/usage", upstream.requests[1].URL.String())
+	require.Equal(t, http.MethodGet, upstream.requests[0].Method)
+	require.Equal(t, "Bearer sk-sensitive", upstream.requests[1].Header.Get("Authorization"))
+	require.True(t, HTTPUpstreamRedirectsDisabled(upstream.requests[1].Context()))
+	require.Equal(t, 5.8, snapshot.RateLimits["7d"].Used)
+	require.Equal(t, "2026-07-20T00:00:00Z", snapshot.RateLimits["7d"].ResetAt)
+	serialized, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+	require.NotContains(t, string(serialized), "must-not-persist")
 
 	persisted := decodeUpstreamBillingProbeSnapshot(account.Extra)
 	require.NotNil(t, persisted)
 	require.Equal(t, snapshot.Status, persisted.Status)
+	require.Equal(t, snapshot.RateLimits, persisted.RateLimits)
+}
+
+func TestParseUpstreamUsageRateLimits(t *testing.T) {
+	limits, err := parseUpstreamUsageRateLimits([]byte(`{
+		"mode":"quota_limited","rate_limits":[
+			{"window":"5h","limit":100,"used":10,"remaining":90,"window_start":"2026-07-13T00:00:00Z","reset_at":"2026-07-13T05:00:00Z"},
+			{"window":"1d","limit":200,"used":160,"remaining":40,"window_start":"2026-07-13T00:00:00Z","reset_at":"2026-07-14T00:00:00Z"},
+			{"window":"7d","limit":600,"used":600,"remaining":0,"window_start":"2026-07-13T00:00:00Z","reset_at":"2026-07-20T00:00:00Z","secret":"discard"}
+		]
+	}`))
+	require.NoError(t, err)
+	require.Len(t, limits, 3)
+	require.Equal(t, 10.0, limits["5h"].Used)
+	require.Equal(t, 40.0, limits["1d"].Remaining)
+	require.Equal(t, "7d", limits["7d"].Window)
+
+	onlySeven, err := parseUpstreamUsageRateLimits([]byte(`{"mode":"quota_limited","rate_limits":[{"window":"7d","limit":600,"used":5.8,"remaining":594.2,"window_start":"2026-07-13T00:00:00Z","reset_at":"2026-07-20T00:00:00Z"}]}`))
+	require.NoError(t, err)
+	require.Len(t, onlySeven, 1)
+	require.Equal(t, 5.8, onlySeven["7d"].Used)
+
+	noLimits, err := parseUpstreamUsageRateLimits([]byte(`{"mode":"unlimited"}`))
+	require.NoError(t, err)
+	require.Nil(t, noLimits)
+	_, err = parseUpstreamUsageRateLimits([]byte(`{"mode":`))
+	require.Error(t, err)
+	_, err = parseUpstreamUsageRateLimits([]byte(`{"mode":"quota_limited","rate_limits":[{"window":"7d","limit":-1,"used":0,"remaining":1,"window_start":"bad","reset_at":"2026-07-20T00:00:00Z"}]}`))
+	require.Error(t, err)
+
+	legacy := decodeUpstreamBillingProbeSnapshot(map[string]any{
+		UpstreamBillingProbeExtraKey: map[string]any{
+			"status": "ok",
+			"data":   map[string]any{"effective_rate_multiplier": 0.8},
+		},
+	})
+	require.NotNil(t, legacy)
+	require.Nil(t, legacy.RateLimits)
+}
+
+type upstreamBillingUsageProbeStub struct {
+	requests  []*http.Request
+	responses []*http.Response
+	errors    []error
+}
+
+func (u *upstreamBillingUsageProbeStub) Do(_ *http.Request, _ string, _ int64, _ int) (*http.Response, error) {
+	return nil, errors.New("unexpected non-TLS request")
+}
+
+func (u *upstreamBillingUsageProbeStub) DoWithTLS(req *http.Request, _ string, _ int64, _ int, _ *tlsfingerprint.Profile) (*http.Response, error) {
+	u.requests = append(u.requests, req)
+	index := len(u.requests) - 1
+	if index < len(u.errors) && u.errors[index] != nil {
+		return nil, u.errors[index]
+	}
+	if index >= len(u.responses) {
+		return nil, errors.New("missing response")
+	}
+	return u.responses[index], nil
+}
+
+func TestUpstreamBillingProbeUsageFailureKeepsBillingSnapshot(t *testing.T) {
+	billing := &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token","group_rate_multiplier":0.8,"resolved_rate_multiplier":0.8,"peak_rate_enabled":false,"effective_rate_multiplier":0.8,"observed_at":"2026-07-13T01:00:00Z"}`))}
+	for _, tt := range []struct {
+		name string
+		resp *http.Response
+		err  error
+	}{
+		{name: "404", resp: &http.Response{StatusCode: http.StatusNotFound, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`not found`))}},
+		{name: "timeout", resp: billing, err: context.DeadlineExceeded},
+		{name: "invalid json", resp: &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{"mode":`))}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			account := &Account{ID: 61, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Credentials: map[string]any{"api_key": "sk-test", "base_url": "https://upstream.example"}}
+			repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{account.ID: account}}
+			first := &http.Response{StatusCode: billing.StatusCode, Header: billing.Header.Clone(), Body: io.NopCloser(strings.NewReader(`{"object":"sub2api.key_billing","schema_version":1,"billing_scope":"token","group_rate_multiplier":0.8,"resolved_rate_multiplier":0.8,"peak_rate_enabled":false,"effective_rate_multiplier":0.8,"observed_at":"2026-07-13T01:00:00Z"}`))}
+			upstream := &upstreamBillingUsageProbeStub{responses: []*http.Response{first, tt.resp}, errors: []error{nil, tt.err}}
+			svc := newUpstreamBillingProbeTestService(repo, upstream, &upstreamBillingProbeSettingRepo{})
+			snapshot, err := svc.ProbeAccount(context.Background(), account.ID)
+			require.NoError(t, err)
+			require.Equal(t, UpstreamBillingProbeStatusOK, snapshot.Status)
+			require.Equal(t, 0.8, snapshot.Data["effective_rate_multiplier"])
+			require.Nil(t, snapshot.RateLimits)
+			require.Len(t, upstream.requests, 2)
+			require.Equal(t, "/v1/sub2api/billing", upstream.requests[0].URL.Path)
+			require.Equal(t, "/v1/usage", upstream.requests[1].URL.Path)
+		})
+	}
 }
 
 func TestUpstreamBillingProbeRejectsMissingRequiredMultiplier(t *testing.T) {
@@ -459,6 +566,7 @@ func TestUpstreamBillingProbeFailurePreservesLastSuccessAndRetryAfter(t *testing
 	previous := &UpstreamBillingProbeSnapshot{
 		Status:       UpstreamBillingProbeStatusOK,
 		Data:         map[string]any{"effective_rate_multiplier": 0.5},
+		RateLimits:   map[string]UpstreamBillingProbeRateLimit{"7d": {Window: "7d", Limit: 600, Used: 5, Remaining: 595}},
 		ReceivedAt:   &receivedAt,
 		FailureCount: 1,
 	}
@@ -485,6 +593,7 @@ func TestUpstreamBillingProbeFailurePreservesLastSuccessAndRetryAfter(t *testing
 	require.NoError(t, err)
 	require.Equal(t, UpstreamBillingProbeStatusFailed, snapshot.Status)
 	require.Equal(t, previous.Data, snapshot.Data)
+	require.Equal(t, previous.RateLimits, snapshot.RateLimits)
 	require.Equal(t, previous.ReceivedAt, snapshot.ReceivedAt)
 	require.NotNil(t, snapshot.FreshUntil)
 	require.Equal(t, receivedAt.Add(time.Hour), *snapshot.FreshUntil)

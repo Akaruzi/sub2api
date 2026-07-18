@@ -153,6 +153,7 @@ export default {
         priority: 'Priority',
         billingRateMultiplier: 'Billing Rate',
         upstreamBillingRate: 'Upstream Declared Rate',
+        upstreamBillingQuota: 'Upstream Quota',
         weight: 'Weight',
         schedulerScore: 'Scheduler Score',
         status: 'Status',
@@ -175,6 +176,9 @@ export default {
       usageWindowsHint: '"5h / 7d" are the upstream account\'s official rolling usage windows (e.g. OpenAI ChatGPT, Claude). They are imposed by the upstream provider on the account itself — not configured by sub2api, and unrelated to the models you map. Usage resets automatically once each window rolls over, and the limit cannot be lifted from within sub2api.',
       upstreamBilling: {
         trustWarning: 'This rate is declared by the upstream site for the current API key. Sub2API cannot verify that it matches actual charges. The upstream site or an intermediary may return forged, stale, or modified data. Verify it against bills, balance changes, and actual usage.',
+        quotaHint: 'Shows only upstream Sub2API API-key limits from the cached /v1/usage probe. This is not an official OpenAI quota; unavailable data is shown as "-".',
+        quotaTitle: 'Upstream Sub2API API Key limits',
+        quotaResetAt: 'Resets: {value}',
         autoProbeSettings: 'Upstream rate auto probe',
         intervalMinutes: 'Probe interval (minutes)',
         autoProbe: 'Auto probe',

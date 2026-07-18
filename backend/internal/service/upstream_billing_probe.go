@@ -82,6 +82,21 @@ type UpstreamBillingProbeSnapshot struct {
 	FailureCount  int            `json:"failure_count,omitempty"`
 	HTTPStatus    int            `json:"http_status,omitempty"`
 	LastError     string         `json:"last_error,omitempty"`
+	// RateLimits is an optional, sanitized snapshot from the upstream
+	// Sub2API /v1/usage endpoint. It deliberately contains no credentials or
+	// unrecognized response fields.
+	RateLimits map[string]UpstreamBillingProbeRateLimit `json:"rate_limits,omitempty"`
+}
+
+// UpstreamBillingProbeRateLimit is one quota-limited upstream API-key window.
+// Amounts are in the upstream's billing unit (currently USD).
+type UpstreamBillingProbeRateLimit struct {
+	Window      string  `json:"window"`
+	Limit       float64 `json:"limit"`
+	Used        float64 `json:"used"`
+	Remaining   float64 `json:"remaining"`
+	WindowStart string  `json:"window_start,omitempty"`
+	ResetAt     string  `json:"reset_at,omitempty"`
 }
 
 // UpstreamBillingProbeResult is returned by manual probe endpoints.
@@ -106,6 +121,20 @@ type upstreamBillingProbeResponse struct {
 	EffectiveRateMultiplier *float64 `json:"effective_rate_multiplier"`
 	Timezone                *string  `json:"timezone"`
 	ObservedAt              string   `json:"observed_at"`
+}
+
+type upstreamUsageResponse struct {
+	Mode       string                           `json:"mode"`
+	RateLimits []upstreamUsageRateLimitResponse `json:"rate_limits"`
+}
+
+type upstreamUsageRateLimitResponse struct {
+	Window      string   `json:"window"`
+	Limit       *float64 `json:"limit"`
+	Used        *float64 `json:"used"`
+	Remaining   *float64 `json:"remaining"`
+	WindowStart string   `json:"window_start"`
+	ResetAt     string   `json:"reset_at"`
 }
 
 // GetUpstreamBillingProbeSettings returns defaults when the setting is absent.
@@ -623,10 +652,101 @@ func (s *UpstreamBillingProbeService) probeLoadedAccount(ctx context.Context, ac
 		NextProbeAt:   now.Add(nextProbeDelay(intervalMinutes, 0, 0)),
 		HTTPStatus:    resp.StatusCode,
 	}
+	// /v1/usage is intentionally best-effort. A remote instance may not expose
+	// it yet, and that must never discard a successfully probed billing rate.
+	snapshot.RateLimits = s.probeUpstreamUsage(ctx, account, normalizedBaseURL, proxyURL, apiKey, tlsProfile)
 	if err := s.updateSnapshot(ctx, account, snapshot); err != nil {
 		return nil, err
 	}
 	return snapshot, nil
+}
+
+func (s *UpstreamBillingProbeService) probeUpstreamUsage(
+	ctx context.Context,
+	account *Account,
+	normalizedBaseURL, proxyURL, apiKey string,
+	tlsProfile *tlsfingerprint.Profile,
+) map[string]UpstreamBillingProbeRateLimit {
+	usageCtx, cancel := context.WithTimeout(ctx, upstreamBillingProbeRequestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(usageCtx, http.MethodGet, buildOpenAIEndpointURL(normalizedBaseURL, "/v1/usage"), nil)
+	if err != nil {
+		return nil
+	}
+	reqCtx := WithHTTPUpstreamProfile(req.Context(), HTTPUpstreamProfileOpenAI)
+	req = req.WithContext(WithHTTPUpstreamRedirectsDisabled(reqCtx))
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	account.ApplyHeaderOverrides(req.Header)
+
+	resp, err := s.accountTestService.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, tlsProfile)
+	if err != nil || resp == nil || resp.Body == nil {
+		return nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, upstreamBillingProbeMaxBodyBytes+1))
+	if err != nil || len(body) > upstreamBillingProbeMaxBodyBytes {
+		return nil
+	}
+	limits, err := parseUpstreamUsageRateLimits(body)
+	if err != nil {
+		return nil
+	}
+	return limits
+}
+
+func parseUpstreamUsageRateLimits(body []byte) (map[string]UpstreamBillingProbeRateLimit, error) {
+	var response upstreamUsageResponse
+	if err := json.Unmarshal(body, &response); err != nil {
+		return nil, err
+	}
+	if response.Mode != "quota_limited" || len(response.RateLimits) == 0 {
+		return nil, nil
+	}
+	limits := make(map[string]UpstreamBillingProbeRateLimit, len(response.RateLimits))
+	for _, raw := range response.RateLimits {
+		if raw.Window != "5h" && raw.Window != "1d" && raw.Window != "7d" {
+			continue
+		}
+		if _, exists := limits[raw.Window]; exists || raw.Limit == nil || raw.Used == nil || raw.Remaining == nil ||
+			!validUpstreamUsageAmount(*raw.Limit) || !validUpstreamUsageAmount(*raw.Used) || !validUpstreamUsageAmount(*raw.Remaining) {
+			return nil, fmt.Errorf("invalid upstream usage rate limit")
+		}
+		windowStart, ok := normalizeUpstreamUsageTime(raw.WindowStart)
+		if !ok {
+			return nil, fmt.Errorf("invalid upstream usage window_start")
+		}
+		resetAt, ok := normalizeUpstreamUsageTime(raw.ResetAt)
+		if !ok {
+			return nil, fmt.Errorf("invalid upstream usage reset_at")
+		}
+		limits[raw.Window] = UpstreamBillingProbeRateLimit{
+			Window: raw.Window, Limit: *raw.Limit, Used: *raw.Used, Remaining: *raw.Remaining,
+			WindowStart: windowStart, ResetAt: resetAt,
+		}
+	}
+	if len(limits) == 0 {
+		return nil, nil
+	}
+	return limits, nil
+}
+
+func validUpstreamUsageAmount(value float64) bool {
+	return value >= 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func normalizeUpstreamUsageTime(value string) (string, bool) {
+	if value == "" {
+		return "", true
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil || parsed.IsZero() {
+		return "", false
+	}
+	return parsed.UTC().Format(time.RFC3339Nano), true
 }
 
 func (s *UpstreamBillingProbeService) persistProbeFailure(
@@ -657,6 +777,7 @@ func (s *UpstreamBillingProbeService) persistProbeFailure(
 	}
 	if previous != nil {
 		snapshot.Data = previous.Data
+		snapshot.RateLimits = previous.RateLimits
 		snapshot.ReceivedAt = previous.ReceivedAt
 		snapshot.FreshUntil = previous.FreshUntil
 		if snapshot.FreshUntil == nil && previous.Status == UpstreamBillingProbeStatusOK && previous.ReceivedAt != nil {
