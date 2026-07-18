@@ -38,8 +38,8 @@ jobs:
           make test-unit 2>&1 | tee /tmp/unit-tests.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            failure=$(rg -i -- '--- FAIL|^FAIL|panic:|error:' /tmp/unit-tests.log | tail -20 | tr '\n' ' ' | cut -c1-3000)
-            echo "::error title=Unit tests failed::${failure:-See the Unit tests log for details.}"
+            failure=$(tail -20 /tmp/unit-tests.log | tr '\n' ' ' | cut -c1-3000)
+            echo "::error title=Unit tests failed::$failure"
             exit "$status"
           fi
       - name: Integration tests
