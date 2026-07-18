@@ -34,6 +34,7 @@ jobs:
         working-directory: backend
         run: |
           set -o pipefail
+          set +e
           make test-unit 2>&1 | tee /tmp/unit-tests.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
