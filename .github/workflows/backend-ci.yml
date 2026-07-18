@@ -32,7 +32,15 @@ jobs:
           go version | grep -q 'go1.26.5'
       - name: Unit tests
         working-directory: backend
-        run: make test-unit
+        run: |
+          set -o pipefail
+          make test-unit 2>&1 | tee /tmp/unit-tests.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            failure=$(rg -i -- '--- FAIL|^FAIL|panic:|error:' /tmp/unit-tests.log | tail -20 | tr '\n' ' ' | cut -c1-3000)
+            echo "::error title=Unit tests failed::${failure:-See the Unit tests log for details.}"
+            exit "$status"
+          fi
       - name: Integration tests
         working-directory: backend
         run: make test-integration
